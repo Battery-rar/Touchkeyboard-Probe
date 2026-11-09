@@ -1,0 +1,5 @@
+1 ICON "Keyboard.ico"
+// KeyboardClassic (E765) from the Windows 11 Segoe Fluent Icons font.
+2 ICON "FluentLight.ico"
+3 ICON "FluentDark.ico"
+1 24 "App.manifest"
