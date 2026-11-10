@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <array>
@@ -50,9 +51,21 @@ bool UsesXamlFocus(HWND window) {
         || !wcscmp(name, L"WinUIDesktopWin32WindowClass") || !wcscmp(name, L"XamlExplorerHostIslandWindow");
 }
 
-void QueueWatchUpdate(HWND hint = nullptr) {
+bool IsTraySurface(HWND window) {
+    auto isTray = [](HWND candidate) {
+        wchar_t name[64]{};
+        GetClassNameW(candidate, name, ARRAYSIZE(name));
+        return !wcscmp(name, L"Shell_TrayWnd") || !wcscmp(name, L"Shell_SecondaryTrayWnd")
+            || !wcscmp(name, L"NotifyIconOverflowWindow") || !wcscmp(name, L"TopLevelWindowForOverflowXamlIsland");
+    };
+    const auto root = GetAncestor(window, GA_ROOT);
+    const auto owner = GetAncestor(window, GA_ROOTOWNER);
+    return isTray(root) || (owner != root && isTray(owner));
+}
+
+void QueueWatchUpdate(HWND hint, bool foregroundChanged = false) {
     if (auto owner = FindWindowW(windowClass, nullptr))
-        PostMessageW(owner, foregroundMessage, reinterpret_cast<WPARAM>(hint), 0);
+        PostMessageW(owner, foregroundMessage, reinterpret_cast<WPARAM>(hint), foregroundChanged);
 }
 
 void CALLBACK FocusChanged(HWINEVENTHOOK, DWORD, HWND window, LONG object, LONG child, DWORD, DWORD time) {
@@ -70,8 +83,8 @@ bool FocusChangedSince(HWND foreground, ULONGLONG time) {
         && focusEvent.time >= time;
 }
 
-void CALLBACK ForegroundChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
-    QueueWatchUpdate();
+void CALLBACK ForegroundChanged(HWINEVENTHOOK, DWORD, HWND window, LONG, LONG, DWORD, DWORD) {
+    QueueWatchUpdate(window, true);
 }
 
 HANDLE StartHelper(wchar_t* args, HANDLE job, bool allowForeground = false, DWORD* thread = nullptr) {
@@ -183,7 +196,9 @@ public:
             return false;
         }
         slate_ = !GetSystemMetrics(SM_CONVERTIBLESLATEMODE);
-        UpdateXamlWatch(GetForegroundWindow());
+        const auto foreground = GetForegroundWindow();
+        RememberApplication(foreground);
+        UpdateXamlWatch(foreground);
         if (!hidden_) AddTray();
         return true;
     }
@@ -223,15 +238,19 @@ private:
         case WM_INPUT:
             UpdatePosture();
             if (slate_ && focusHook_) {
-                const auto time = EventTick(static_cast<DWORD>(GetMessageTime()));
-                auto tap = input_.Read(reinterpret_cast<HRAWINPUT>(lp));
-                if (tap.started) BeginTap(tap.device, *tap.started, time);
-                if (tap.completed && tap.device == contactDevice_) {
-                    FocusTrace("up valid=%d changed=%d focus=%p expected=%p", bool(tap.point),
-                        FocusChangedSince(contactWindow_, contactDownTime_), FocusWindow(contactWindow_), contactFocus_);
-                    contactDevice_ = nullptr;
-                    if (tap.point && ValidateTap()) CompleteTap(*tap.point);
-                }
+                struct InputContext { App& app; ULONGLONG time; };
+                InputContext state{*this, EventTick(static_cast<DWORD>(GetMessageTime()))};
+                input_.Read(reinterpret_cast<HRAWINPUT>(lp), &state, [](void* context, const Tap& tap) {
+                    const auto& [app, time] = *static_cast<InputContext*>(context);
+                    if (tap.started) app.BeginTap(tap.device, *tap.started, time);
+                    if (tap.completed && tap.device == app.contactDevice_) {
+                        FocusTrace("up valid=%d changed=%d focus=%p expected=%p", bool(tap.point),
+                            FocusChangedSince(app.contactWindow_, app.contactDownTime_),
+                            FocusWindow(app.contactWindow_), app.contactFocus_);
+                        app.contactDevice_ = nullptr;
+                        if (tap.point && app.ValidateTap()) app.CompleteTap(*tap.point);
+                    }
+                });
             }
             break;
         case WM_INPUT_DEVICE_CHANGE:
@@ -259,8 +278,10 @@ private:
             if (LOWORD(lp) == WM_CONTEXTMENU || (!version4_ && LOWORD(lp) == WM_RBUTTONUP))
                 Menu(true, version4_ ? wp : 0);
             else if (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT
-                || (!version4_ && LOWORD(lp) == WM_LBUTTONUP))
+                || (!version4_ && LOWORD(lp) == WM_LBUTTONUP)) {
+                RestoreTrayFocus();
                 StartKeyboard();
+            }
             return 0;
         case recoverMessage:
             Menu();
@@ -284,7 +305,9 @@ private:
             return 0;
         case foregroundMessage: {
             const auto foreground = GetForegroundWindow();
-            if (!wp || reinterpret_cast<HWND>(wp) == foreground) UpdateXamlWatch(foreground, !wp);
+            const auto hint = reinterpret_cast<HWND>(wp);
+            if (lp) RememberApplication(hint);
+            if (lp || hint == foreground) UpdateXamlWatch(foreground, lp != 0);
             return 0;
         }
         case focusSnapshotMismatchMessage:
@@ -418,6 +441,27 @@ private:
             return helper.process ? &helper : nullptr;
         }
         return nullptr;
+    }
+
+    void RememberApplication(HWND window) {
+        if (!window || window == window_ || IsTraySurface(window)) return;
+        wchar_t name[64]{};
+        if (!GetClassNameW(window, name, ARRAYSIZE(name)) || !wcscmp(name, menuWindowClass)) return;
+        lastApplicationWindow_ = !wcscmp(name, L"Progman") || !wcscmp(name, L"WorkerW")
+            ? nullptr : window;
+    }
+
+    void RestoreTrayFocus() {
+        const auto foreground = GetForegroundWindow();
+        const auto target = lastApplicationWindow_;
+        if (!target || !IsTraySurface(foreground) || !IsWindowVisible(target) || IsIconic(target)) return;
+        auto dwm = LoadLibraryExW(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!dwm) return;
+        auto attribute = reinterpret_cast<decltype(&DwmGetWindowAttribute)>(GetProcAddress(dwm, "DwmGetWindowAttribute"));
+        DWORD cloaked = 0;
+        const bool visible = attribute && SUCCEEDED(attribute(target, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && !cloaked;
+        FreeLibrary(dwm);
+        if (visible && GetForegroundWindow() == foreground) SetForegroundWindow(target);
     }
 
     void StartKeyboard() {
@@ -614,7 +658,7 @@ private:
     bool helperTimerRunning_{};
     HANDLE menuProcess_{};
     HANDLE job_{};
-    HWND menuPreviousWindow_{};
+    HWND menuPreviousWindow_{}, lastApplicationWindow_{};
     ULONGLONG menuChecked_{}, menuResponsive_{}, menuClosingDeadline_{};
     HWINEVENTHOOK focusHook_{};
     HWINEVENTHOOK foregroundHook_{};

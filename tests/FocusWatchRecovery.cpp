@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dwmapi.h>
 #include <array>
 #include <cstddef>
 #include <cwchar>
@@ -10,14 +11,36 @@
 namespace {
 const HWND testWindow = reinterpret_cast<HWND>(1);
 const HWND testFocus = reinterpret_cast<HWND>(2);
+const HWND trayWindow = reinterpret_cast<HWND>(4);
 constexpr DWORD watcherThread = 10;
 HWND foreground = testWindow;
 unsigned refreshes = 0;
+unsigned restores = 0;
+DWORD cloaked = 0;
 
 HWND TestForegroundWindow() { return foreground; }
 HWND TestAncestor(HWND window, UINT) { return window == testFocus ? testWindow : window; }
 HWND TestWindowFromPoint(POINT) { return testWindow; }
-int TestClassName(HWND, LPWSTR name, int count) { return lstrlenW(lstrcpynW(name, L"ApplicationFrameWindow", count)); }
+int TestClassName(HWND window, LPWSTR name, int count) {
+    const auto cls = window == trayWindow ? L"Shell_TrayWnd" : L"ApplicationFrameWindow";
+    return lstrlenW(lstrcpynW(name, cls, count));
+}
+BOOL TestSetForegroundWindow(HWND window) {
+    foreground = window;
+    ++restores;
+    return TRUE;
+}
+BOOL TestIsWindowVisible(HWND window) { return window != nullptr; }
+BOOL TestIsIconic(HWND) { return FALSE; }
+UINT_PTR TestSetTimer(HWND, UINT_PTR, UINT, TIMERPROC) { return 0; }
+HRESULT WINAPI TestDwmAttribute(HWND, DWORD, PVOID result, DWORD) {
+    *static_cast<DWORD*>(result) = cloaked;
+    return S_OK;
+}
+FARPROC TestGetProcAddress(HMODULE module, LPCSTR name) {
+    if (!lstrcmpA(name, "DwmGetWindowAttribute")) return reinterpret_cast<FARPROC>(TestDwmAttribute);
+    return GetProcAddress(module, name);
+}
 int TestSystemMetrics(int index) { return index == SM_CONVERTIBLESLATEMODE ? 0 : GetSystemMetrics(index); }
 BOOL TestPostThreadMessage(DWORD thread, UINT message, WPARAM wp, LPARAM) {
     if (thread == watcherThread && message == readFocusMessage && wp) ++refreshes;
@@ -31,6 +54,11 @@ BOOL TestPostThreadMessage(DWORD thread, UINT message, WPARAM wp, LPARAM) {
 #define GetClassNameW TestClassName
 #define GetSystemMetrics TestSystemMetrics
 #define PostThreadMessageW TestPostThreadMessage
+#define SetForegroundWindow TestSetForegroundWindow
+#define IsWindowVisible TestIsWindowVisible
+#define IsIconic TestIsIconic
+#define SetTimer TestSetTimer
+#define GetProcAddress TestGetProcAddress
 #define private public
 #include "../native/Tray.cpp"
 #undef private
@@ -56,7 +84,7 @@ int main() {
     app.watch_.thread = watcherThread;
 
     // The foreground notification can reach the tray after the same window is already back.
-    app.OnMessage(nullptr, foregroundMessage, 0, 0);
+    app.OnMessage(nullptr, foregroundMessage, reinterpret_cast<WPARAM>(testWindow), TRUE);
     if (refreshes != 1 || app.watch_.identity != 9) return 2;
     app.OnMessage(nullptr, foregroundMessage, reinterpret_cast<WPARAM>(testWindow), 0);
     if (refreshes != 1) return 3;
@@ -90,5 +118,23 @@ int main() {
     app.BeginTap(device, {50, 50}, GetTickCount64() + 1);
     if (refreshes != 3 || app.contactDevice_) return 8;
     CloseHandle(running);
+    app.watch_ = {};
+    app.slate_ = false;
+
+    // Shell activation can put the taskbar in the foreground before it sends NIN_SELECT.
+    app.OnMessage(nullptr, foregroundMessage, reinterpret_cast<WPARAM>(testWindow), TRUE);
+    foreground = trayWindow;
+    app.OnMessage(nullptr, foregroundMessage, reinterpret_cast<WPARAM>(trayWindow), TRUE);
+    app.OnMessage(nullptr, trayMessage, 0, NIN_SELECT);
+    if (foreground != testWindow || restores != 1) return 11;
+
+    // Keep a foreground app in place, and never switch to a cloaked window.
+    foreground = reinterpret_cast<HWND>(5);
+    app.OnMessage(nullptr, trayMessage, 0, NIN_SELECT);
+    if (restores != 1) return 12;
+    foreground = trayWindow;
+    cloaked = DWM_CLOAKED_SHELL;
+    app.OnMessage(nullptr, trayMessage, 0, NIN_SELECT);
+    if (foreground != trayWindow || restores != 1) return 13;
     return 0;
 }

@@ -145,28 +145,24 @@ Tap TouchInput::Device::Observe(PCHAR report, DWORD length) {
     return result;
 }
 
-Tap TouchInput::Read(HRAWINPUT input) {
+void TouchInput::Read(HRAWINPUT input, void* context, void (*onTap)(void*, const Tap&)) {
     UINT size = 0;
     if (GetRawInputData(input, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0
-        || size < offsetof(RAWINPUT, data.hid.bRawData) || size > 65536) return {};
+        || size < offsetof(RAWINPUT, data.hid.bRawData) || size > 65536) return;
     if (size > buffer_.size()) buffer_.resize(size);
-    if (GetRawInputData(input, RID_INPUT, buffer_.data(), &size, sizeof(RAWINPUTHEADER)) != size) return {};
+    if (GetRawInputData(input, RID_INPUT, buffer_.data(), &size, sizeof(RAWINPUTHEADER)) != size) return;
     const auto* raw = reinterpret_cast<const RAWINPUT*>(buffer_.data());
     const auto& hid = raw->data.hid;
     if (raw->header.dwType != RIM_TYPEHID || !raw->header.hDevice || !hid.dwSizeHid
-        || hid.dwCount > (size - offsetof(RAWINPUT, data.hid.bRawData)) / hid.dwSizeHid) return {};
-    if (devices_.size() >= 32 && !devices_.contains(raw->header.hDevice)) return {};
+        || hid.dwCount > (size - offsetof(RAWINPUT, data.hid.bRawData)) / hid.dwSizeHid) return;
+    if (devices_.size() >= 32 && !devices_.contains(raw->header.hDevice)) return;
     auto& device = devices_.try_emplace(raw->header.hDevice, raw->header.hDevice).first->second;
-    Tap result;
     for (DWORD i = 0; i < hid.dwCount; ++i) {
         auto tap = device.Observe(reinterpret_cast<PCHAR>(const_cast<BYTE*>(hid.bRawData) + i * hid.dwSizeHid),
             hid.dwSizeHid);
-        if (tap.started) result = tap;
-        if (tap.completed) {
-            result.completed = true;
-            result.point = tap.point;
+        if (tap.started || tap.completed) {
+            tap.device = raw->header.hDevice;
+            onTap(context, tap);
         }
     }
-    result.device = raw->header.hDevice;
-    return result;
 }

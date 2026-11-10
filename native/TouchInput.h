@@ -29,7 +29,7 @@ class TouchInput {
 public:
     static bool Register(HWND window);
     void DeviceChanged(HANDLE device);
-    Tap Read(HRAWINPUT input);
+    void Read(HRAWINPUT input, void* context, void (*onTap)(void*, const Tap&));
 
 private:
     struct Device {
