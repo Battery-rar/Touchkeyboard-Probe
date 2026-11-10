@@ -28,7 +28,6 @@ const CLSID automationClass = __uuidof(CUIAutomation8);
 constexpr CLSID keyboardClass{0x4ce576fa, 0x83dc, 0x4f88, {0x95, 0x1c, 0x9d, 0x07, 0x82, 0xb4, 0xe3, 0x76}};
 constexpr CLSID paneClass{0xd5120aa3, 0x46ba, 0x44c5, {0x82, 0x2d, 0xca, 0x80, 0x92, 0xc1, 0xfc, 0x72}};
 constexpr IID tipId{0x37c994e7, 0x432b, 0x4834, {0xa2, 0xf7, 0xdc, 0xe1, 0xf1, 0x3b, 0x83, 0x4b}};
-constexpr UINT readFocusMessage = WM_APP + 1;
 
 struct ITipInvocation : IUnknown { virtual HRESULT STDMETHODCALLTYPE Toggle(HWND window) = 0; };
 
@@ -165,7 +164,7 @@ public:
         PostThreadMessageW(thread_, readFocusMessage, 0, 0);
         return S_OK;
     }
-    void ReadFocus(IUIAutomation* ui, IUIAutomationCacheRequest* cache) {
+    void ReadFocus(IUIAutomation* ui, IUIAutomationCacheRequest* cache, bool republish = false) {
         if (GetForegroundWindow() != foreground_) return;
         IUIAutomationElement* focused = nullptr;
         ui->GetFocusedElementBuildCache(cache, &focused);
@@ -179,12 +178,14 @@ public:
             return;
         }
         const auto identity = RuntimeIdentity(element.get(), automation_);
-        if (revision_ && identity == identity_) return;
-        identity_ = identity;
-        const auto revision = ++revision_;
-        FocusTrace("XAML snapshot generation=%lu revision=%lu identity=%llu pid=%d",
-            generation_, revision, identity, source);
-        PostMessageW(owner_, focusSnapshotMessage, (UINT_PTR(generation_) << 32) | revision, LPARAM(identity));
+        if (!republish && revision_ && identity == identity_) return;
+        const auto revision = revision_ + 1;
+        if (PostMessageW(owner_, focusSnapshotMessage, (UINT_PTR(generation_) << 32) | revision, LPARAM(identity))) {
+            revision_ = revision;
+            identity_ = identity;
+            FocusTrace("XAML snapshot generation=%lu revision=%lu identity=%llu pid=%d",
+                generation_, revision, identity, source);
+        }
     }
 
 private:
@@ -287,7 +288,7 @@ Com<IUIAutomationElement> EditableAncestor(IUIAutomationTreeWalker* walker, Com<
 
 Com<IUIAutomationElement> FocusedField(IUIAutomation* ui, IUIAutomationTreeWalker* walker,
     POINT point, HWND foreground, const ComRuntime& runtime, const POINT* down = nullptr,
-    UINT_PTR previousFocus = 0) {
+    UINT_PTR previousFocus = 0, bool* snapshotMismatch = nullptr) {
     auto cache = FieldCache(ui);
     if (!cache) return {};
     IUIAutomationElement* focused = nullptr;
@@ -296,6 +297,7 @@ Com<IUIAutomationElement> FocusedField(IUIAutomation* ui, IUIAutomationTreeWalke
     if (previousFocus) {
         const auto current = RuntimeIdentity(focus.get(), GetModuleHandleW(L"oleaut32.dll"));
         if (current != previousFocus) {
+            if (snapshotMismatch) *snapshotMismatch = true;
             FocusTrace("XAML focus differs from touch-down snapshot expected=%llu current=%llu", previousFocus, current);
             return {};
         }
@@ -367,7 +369,9 @@ int CheckTap(HWND owner, UINT_PTR ticket, HWND foreground, HWND focus, POINT dow
     ui->get_RawViewWalker(&rawWalker);
     Com<IUIAutomationTreeWalker> walker(rawWalker);
     if (!walker) return 0;
-    auto field = FocusedField(ui.get(), walker.get(), up, foreground, runtime, &down, previousFocus);
+    bool snapshotMismatch = false;
+    auto field = FocusedField(ui.get(), walker.get(), up, foreground, runtime, &down, previousFocus, &snapshotMismatch);
+    if (snapshotMismatch) PostMessageW(owner, focusSnapshotMismatchMessage, ticket, 0);
     if (!field || FocusWindow(foreground) != focus) return 0;
     OpenSystemKeyboard(runtime, [&] {
         // Leave the request cancelable while the system prepares the keyboard.
@@ -402,12 +406,14 @@ int WatchFocus(HWND owner, HWND foreground, DWORD generation) {
             NativeFocusChanged, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         observer->ReadFocus(ui.get(), cache.get());
         while (MsgWaitForMultipleObjectsEx(1, &parent, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) == WAIT_OBJECT_0 + 1) {
-            bool refresh = false;
+            bool refresh = false, republish = false;
             for (int i = 0; i < 64 && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++i) {
-                if (!message.hwnd && message.message == readFocusMessage) refresh = true;
-                else DispatchMessageW(&message);
+                if (!message.hwnd && message.message == readFocusMessage) {
+                    refresh = true;
+                    republish |= message.wParam != 0;
+                } else DispatchMessageW(&message);
             }
-            if (refresh) observer->ReadFocus(ui.get(), cache.get());
+            if (refresh) observer->ReadFocus(ui.get(), cache.get(), republish);
         }
         if (hook) UnhookWinEvent(hook);
         ui->RemoveFocusChangedEventHandler(observer.get());

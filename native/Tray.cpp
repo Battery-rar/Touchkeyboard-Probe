@@ -74,7 +74,7 @@ void CALLBACK ForegroundChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, D
     QueueWatchUpdate();
 }
 
-HANDLE StartHelper(wchar_t* args, HANDLE job, bool allowForeground = false) {
+HANDLE StartHelper(wchar_t* args, HANDLE job, bool allowForeground = false, DWORD* thread = nullptr) {
     static wchar_t executable[32768];
     const auto length = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
     if (!length || length >= ARRAYSIZE(executable)) return nullptr;
@@ -105,6 +105,7 @@ HANDLE StartHelper(wchar_t* args, HANDLE job, bool allowForeground = false) {
         process.hProcess = nullptr;
     }
     CloseHandle(process.hThread);
+    if (thread) *thread = process.hProcess ? process.dwThreadId : 0;
     return process.hProcess;
 }
 
@@ -283,9 +284,13 @@ private:
             return 0;
         case foregroundMessage: {
             const auto foreground = GetForegroundWindow();
-            if (!wp || reinterpret_cast<HWND>(wp) == foreground) UpdateXamlWatch(foreground);
+            if (!wp || reinterpret_cast<HWND>(wp) == foreground) UpdateXamlWatch(foreground, !wp);
             return 0;
         }
+        case focusSnapshotMismatchMessage:
+            if (wp == tapTicket_ && !contactDevice_ && contactIdentity_ && ValidateTap())
+                RefreshXamlWatch();
+            return 0;
         case focusSnapshotMessage:
             if (watch_.process && DWORD(wp >> 32) == watch_.generation && DWORD(wp) > watch_.revision
                 && GetForegroundWindow() == watch_.window) {
@@ -430,9 +435,16 @@ private:
         watch_.generation = generation;
     }
 
-    void UpdateXamlWatch(HWND foreground) {
+    void RefreshXamlWatch() {
+        if (watch_.thread) PostThreadMessageW(watch_.thread, readFocusMessage, 1, 0);
+    }
+
+    void UpdateXamlWatch(HWND foreground, bool refresh = false) {
         if (watch_.process && watch_.window == foreground && slate_
-            && WaitForSingleObject(watch_.process, 0) == WAIT_TIMEOUT) return;
+            && WaitForSingleObject(watch_.process, 0) == WAIT_TIMEOUT) {
+            if (refresh) RefreshXamlWatch();
+            return;
+        }
         if (watch_.process) StopXamlWatch();
         if (!slate_ || !UsesXamlFocus(foreground) || !EnsureHelperTimer()) return;
         wchar_t args[144];
@@ -440,7 +452,7 @@ private:
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(window_)),
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(foreground)), ++watch_.generation) <= 0)
             return;
-        watch_.process = StartHelper(args, job_);
+        watch_.process = StartHelper(args, job_, false, &watch_.thread);
         watch_.window = foreground;
         watch_.started = GetTickCount64();
     }
@@ -463,6 +475,7 @@ private:
         if (UsesXamlFocus(foreground)) {
             UpdateXamlWatch(foreground);
             if (!watch_.identity || watch_.changed >= time) {
+                if (!watch_.identity && watch_.revision) RefreshXamlWatch();
                 FocusTrace("XAML touch-down has no stable snapshot");
                 return;
             }
@@ -617,7 +630,7 @@ private:
     struct {
         HANDLE process{};
         HWND window{};
-        DWORD generation{}, revision{};
+        DWORD generation{}, revision{}, thread{};
         UINT_PTR identity{};
         ULONGLONG started{}, changed{};
     } watch_;
