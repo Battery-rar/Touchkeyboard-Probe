@@ -77,11 +77,19 @@ Com<IUIAutomation> CreateAutomation(const ComRuntime& runtime) {
     return ui;
 }
 
-template<class CanOpen> void OpenSystemKeyboard(const ComRuntime& runtime, CanOpen canOpen) {
-    auto lock = CreateMutexW(nullptr, TRUE, L"Local\\TouchKeyboardProbe.Keyboard");
-    if (!lock) return;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(lock);
+HANDLE TryLockKeyboard(const wchar_t* name, DWORD timeout = 0) {
+    auto lock = CreateMutexW(nullptr, FALSE, name);
+    if (!lock) return nullptr;
+    const auto state = WaitForSingleObject(lock, timeout);
+    if (state == WAIT_OBJECT_0 || state == WAIT_ABANDONED) return lock;
+    CloseHandle(lock);
+    return nullptr;
+}
+
+template<class CanOpen> void OpenSystemKeyboard(const ComRuntime& runtime, CanOpen canOpen, DWORD lockTimeout = 0) {
+    auto lock = TryLockKeyboard(L"Local\\TouchKeyboardProbe.Keyboard", lockTimeout);
+    if (!lock) {
+        FocusTrace("keyboard lock unavailable");
         return;
     }
     auto pane = runtime.Create<IFrameworkInputPane>(paneClass, __uuidof(IFrameworkInputPane), CLSCTX_INPROC_SERVER);
@@ -90,6 +98,7 @@ template<class CanOpen> void OpenSystemKeyboard(const ComRuntime& runtime, CanOp
     FocusTrace("pane location hr=%lx bounds=%ld,%ld,%ld,%ld", located, bounds.left, bounds.top, bounds.right, bounds.bottom);
     if (SUCCEEDED(located) && IsRectEmpty(&bounds)) {
         auto keyboard = runtime.Create<ITipInvocation>(keyboardClass, tipId, CLSCTX_ALL);
+        FocusTrace("keyboard object=%d", bool(keyboard));
         if (keyboard && canOpen()) {
             const auto toggled = keyboard->Toggle(GetDesktopWindow());
             FocusTrace("toggle hr=%lx", toggled);
@@ -362,8 +371,10 @@ int CheckTap(HWND owner, UINT_PTR ticket, HWND foreground, HWND focus, POINT dow
     FocusTrace("check tap initial focus=%p expected=%p", FocusWindow(foreground), focus);
     if (FocusWindow(foreground) != focus || GetSystemMetrics(SM_CONVERTIBLESLATEMODE)) return 0;
     ComRuntime runtime;
+    FocusTrace("tap COM ready=%d", runtime.Ready());
     if (!runtime.Ready()) return 0;
     auto ui = CreateAutomation(runtime);
+    FocusTrace("tap UIA ready=%d", bool(ui));
     if (!ui) return 0;
     IUIAutomationTreeWalker* rawWalker = nullptr;
     ui->get_RawViewWalker(&rawWalker);
@@ -372,15 +383,20 @@ int CheckTap(HWND owner, UINT_PTR ticket, HWND foreground, HWND focus, POINT dow
     bool snapshotMismatch = false;
     auto field = FocusedField(ui.get(), walker.get(), up, foreground, runtime, &down, previousFocus, &snapshotMismatch);
     if (snapshotMismatch) PostMessageW(owner, focusSnapshotMismatchMessage, ticket, 0);
+    FocusTrace("tap field=%d focus=%p", bool(field), FocusWindow(foreground));
     if (!field || FocusWindow(foreground) != focus) return 0;
+    // Brief contention must not discard the current tap; its ticket is rechecked after acquiring the lock.
     OpenSystemKeyboard(runtime, [&] {
         // Leave the request cancelable while the system prepares the keyboard.
         DWORD_PTR valid = 0;
         if (!SendMessageTimeoutW(owner, validateTapMessage, ticket, 0,
-            SMTO_BLOCK | SMTO_ABORTIFHUNG, 100, &valid)) return false;
+            SMTO_BLOCK | SMTO_ABORTIFHUNG, 100, &valid)) {
+            FocusTrace("validate ticket=%llu error=%lu", ticket, GetLastError());
+            return false;
+        }
         FocusTrace("validate ticket=%llu allowed=%llu", ticket, valid);
         return valid && FocusWindow(foreground) == focus && !GetSystemMetrics(SM_CONVERTIBLESLATEMODE);
-    });
+    }, 250);
     return 0;
 }
 
