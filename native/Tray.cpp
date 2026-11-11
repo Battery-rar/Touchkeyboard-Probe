@@ -2,6 +2,7 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <windowsx.h>
+#include <wtsapi32.h>
 #include <array>
 #include <cwchar>
 #include "TouchInput.h"
@@ -18,19 +19,39 @@ constexpr wchar_t hiddenValue[] = L"TrayHidden";
 constexpr UINT trayMessage = WM_APP + 1, recoverMessage = WM_APP + 2;
 constexpr UINT commandMessage = WM_APP + 3, statusMessage = WM_APP + 4;
 constexpr UINT foregroundMessage = WM_APP + 7;
-constexpr UINT_PTR trayTimer = 1, helperTimer = 2;
+constexpr UINT_PTR recoveryTimer = 1, helperTimer = 2;
+constexpr ULONGLONG helperTimeout = 4000;
 
-struct Shell {
-    HMODULE module = LoadLibraryExW(L"shell32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    ~Shell() { if (module) FreeLibrary(module); }
+struct SystemLibrary {
+    explicit SystemLibrary(const wchar_t* name) : module(LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {}
+    ~SystemLibrary() { if (module) FreeLibrary(module); }
+    SystemLibrary(const SystemLibrary&) = delete;
+
     template<class T> T Find(const char* name) const {
         return module ? reinterpret_cast<T>(GetProcAddress(module, name)) : nullptr;
     }
+
+private:
+    HMODULE module;
+};
+
+struct Shell : SystemLibrary {
+    Shell() : SystemLibrary(L"shell32.dll") {}
     bool Notify(DWORD command, NOTIFYICONDATAW& data) const {
         auto notify = Find<decltype(&Shell_NotifyIconW)>("Shell_NotifyIconW");
         return notify && notify(command, &data);
     }
 };
+
+bool SessionNotifications(HWND window, bool enable) {
+    const SystemLibrary wts(L"wtsapi32.dll");
+    if (enable) {
+        const auto subscribe = wts.Find<decltype(&WTSRegisterSessionNotification)>("WTSRegisterSessionNotification");
+        return subscribe && subscribe(window, NOTIFY_FOR_THIS_SESSION);
+    }
+    const auto unsubscribe = wts.Find<decltype(&WTSUnRegisterSessionNotification)>("WTSUnRegisterSessionNotification");
+    return unsubscribe && unsubscribe(window);
+}
 
 struct FocusEvent {
     HWND window{};
@@ -87,6 +108,13 @@ void CALLBACK ForegroundChanged(HWINEVENTHOOK, DWORD, HWND window, LONG, LONG, D
     QueueWatchUpdate(window, true);
 }
 
+void StopHelper(HANDLE& process) {
+    if (!process) return;
+    TerminateProcess(process, 0);
+    CloseHandle(process);
+    process = nullptr;
+}
+
 HANDLE StartHelper(wchar_t* args, HANDLE job, bool allowForeground = false, DWORD* thread = nullptr) {
     static wchar_t executable[32768];
     const auto length = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
@@ -112,11 +140,7 @@ HANDLE StartHelper(wchar_t* args, HANDLE job, bool allowForeground = false, DWOR
     HeapFree(GetProcessHeap(), 0, attributes);
     if (!started) return nullptr;
     if (allowForeground) AllowSetForegroundWindow(process.dwProcessId);
-    if (ResumeThread(process.hThread) == DWORD(-1)) {
-        TerminateProcess(process.hProcess, 0);
-        CloseHandle(process.hProcess);
-        process.hProcess = nullptr;
-    }
+    if (ResumeThread(process.hThread) == DWORD(-1)) StopHelper(process.hProcess);
     CloseHandle(process.hThread);
     if (thread) *thread = process.hProcess ? process.dwThreadId : 0;
     return process.hProcess;
@@ -179,10 +203,6 @@ public:
         window_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, windowClass, appName,
             WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, this);
         if (!window_) return false;
-        if (!TouchInput::Register(window_)) {
-            DestroyWindow(window_);
-            return false;
-        }
         focusHook_ = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, nullptr, FocusChanged,
             0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
@@ -199,7 +219,7 @@ public:
         const auto foreground = GetForegroundWindow();
         RememberApplication(foreground);
         UpdateXamlWatch(foreground);
-        if (!hidden_) AddTray();
+        RepairRegistrations();
         return true;
     }
 
@@ -231,27 +251,12 @@ private:
     LRESULT OnMessage(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (taskbarCreated_ && message == taskbarCreated_) {
             iconAdded_ = false;
-            AddTray();
+            RepairRegistrations();
             return 0;
         }
         switch (message) {
         case WM_INPUT:
-            UpdatePosture();
-            if (slate_ && focusHook_) {
-                struct InputContext { App& app; ULONGLONG time; };
-                InputContext state{*this, EventTick(static_cast<DWORD>(GetMessageTime()))};
-                input_.Read(reinterpret_cast<HRAWINPUT>(lp), &state, [](void* context, const Tap& tap) {
-                    const auto& [app, time] = *static_cast<InputContext*>(context);
-                    if (tap.started) app.BeginTap(tap.device, *tap.started, time);
-                    if (tap.completed && tap.device == app.contactDevice_) {
-                        FocusTrace("up valid=%d changed=%d focus=%p expected=%p", bool(tap.point),
-                            FocusChangedSince(app.contactWindow_, app.contactDownTime_),
-                            FocusWindow(app.contactWindow_), app.contactFocus_);
-                        app.contactDevice_ = nullptr;
-                        if (tap.point && app.ValidateTap()) app.CompleteTap(*tap.point);
-                    }
-                });
-            }
+            ReadTouch(reinterpret_cast<HRAWINPUT>(lp));
             break;
         case WM_INPUT_DEVICE_CHANGE:
             if (auto device = reinterpret_cast<HANDLE>(lp)) {
@@ -260,9 +265,22 @@ private:
             }
             return 0;
         case WM_DISPLAYCHANGE:
-            input_ = TouchInput{};
-            CancelTap();
+            ResetTouch();
             break;
+        case WM_POWERBROADCAST:
+            if (wp == PBT_APMSUSPEND || wp == PBT_APMRESUMEAUTOMATIC) {
+                sleeping_ = wp == PBT_APMSUSPEND;
+                ResetSessionInput();
+                return TRUE;
+            }
+            break;
+        case WM_WTSSESSION_CHANGE:
+            if (wp == WTS_SESSION_LOCK || wp == WTS_SESSION_UNLOCK) {
+                sessionLocked_ = wp == WTS_SESSION_LOCK;
+                if (!sessionLocked_) sleeping_ = false;
+                ResetSessionInput();
+            }
+            return 0;
         case WM_SETTINGCHANGE:
             UpdatePosture();
             RefreshIcon();
@@ -271,10 +289,11 @@ private:
             RefreshIcon();
             break;
         case WM_TIMER:
-            if (wp == trayTimer) AddTray();
+            if (wp == recoveryTimer) RepairRegistrations();
             if (wp == helperTimer) CheckHelpers();
             return 0;
         case trayMessage:
+            if (InputPaused()) return 0;
             if (LOWORD(lp) == WM_CONTEXTMENU || (!version4_ && LOWORD(lp) == WM_RBUTTONUP))
                 Menu(true, version4_ ? wp : 0);
             else if (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT
@@ -291,7 +310,7 @@ private:
             return 0;
         case statusMessage: return hidden_ ? 2 : iconAdded_ ? 1 : 3;
         case validateTapMessage:
-            if (wp != tapTicket_ || contactDevice_ || !ValidateTap()) return 0;
+            if (wp != tapTicket_ || contact_.device || !ValidateTap()) return 0;
             for (auto& helper : focusHelpers_) {
                 if (helper.process && helper.ticket == wp) {
                     helper.ticket = 0;
@@ -301,7 +320,7 @@ private:
             return 0;
         case menuClosingMessage:
             if (menuProcess_ && wp == GetProcessId(menuProcess_) && !menuClosingDeadline_)
-                menuClosingDeadline_ = GetTickCount64() + 4000;
+                menuClosingDeadline_ = GetTickCount64() + helperTimeout;
             return 0;
         case foregroundMessage: {
             const auto foreground = GetForegroundWindow();
@@ -311,13 +330,14 @@ private:
             return 0;
         }
         case focusSnapshotMismatchMessage:
-            if (wp == tapTicket_ && !contactDevice_ && contactIdentity_ && ValidateTap())
+            if (wp == tapTicket_ && !contact_.device && contact_.identity && ValidateTap())
                 RefreshXamlWatch();
             return 0;
         case focusSnapshotMessage:
             if (watch_.process && DWORD(wp >> 32) == watch_.generation && DWORD(wp) > watch_.revision
                 && GetForegroundWindow() == watch_.window) {
                 watch_.revision = DWORD(wp);
+                watch_.deadline = 0;
                 const auto identity = static_cast<UINT_PTR>(lp);
                 if (identity != watch_.identity) {
                     watch_.identity = identity;
@@ -332,16 +352,14 @@ private:
             if (wp) DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
+            KillTimer(window_, recoveryTimer);
+            if (sessionRegistered_) SessionNotifications(window_, false);
             TouchInput::Register(nullptr);
             if (focusHook_) UnhookWinEvent(focusHook_);
             if (foregroundHook_) UnhookWinEvent(foregroundHook_);
             RemoveTray();
-            CancelTap();
-            KillTimer(window_, helperTimer);
+            StopWorkers();
             if (job_) CloseHandle(job_);
-            if (watch_.process) CloseHandle(watch_.process);
-            for (auto& helper : focusHelpers_) if (helper.process) CloseHandle(helper.process);
-            if (menuProcess_) CloseHandle(menuProcess_);
             window_ = nullptr;
             PostQuitMessage(0);
             return 0;
@@ -373,9 +391,6 @@ private:
         if (iconAdded_) {
             data.uVersion = NOTIFYICON_VERSION_4;
             version4_ = shell.Notify(NIM_SETVERSION, data);
-            KillTimer(window_, trayTimer);
-        } else {
-            SetTimer(window_, trayTimer, 2000, nullptr);
         }
     }
 
@@ -398,7 +413,6 @@ private:
     }
 
     void RemoveTray() {
-        KillTimer(window_, trayTimer);
         if (iconAdded_) {
             auto data = TrayData();
             Shell{}.Notify(NIM_DELETE, data);
@@ -414,7 +428,20 @@ private:
         if (hidden != hidden_ && !WriteHidden(hidden)) return;
         hidden_ = hidden;
         if (hidden_) RemoveTray();
-        else AddTray();
+        RepairRegistrations();
+    }
+
+    bool InputPaused() const { return sleeping_ || sessionLocked_; }
+
+    void RepairRegistrations() {
+        if (InputPaused()) return;
+        if (!inputRegistered_) inputRegistered_ = TouchInput::Register(window_);
+        if (!sessionRegistered_) sessionRegistered_ = SessionNotifications(window_, true);
+        AddTray();
+        if (inputRegistered_ && sessionRegistered_ && (hidden_ || iconAdded_))
+            KillTimer(window_, recoveryTimer);
+        else
+            SetTimer(window_, recoveryTimer, 2000, nullptr);
     }
 
     struct Helper {
@@ -426,6 +453,11 @@ private:
     bool EnsureHelperTimer() {
         if (!helperTimerRunning_) helperTimerRunning_ = SetTimer(window_, helperTimer, 200, nullptr) != 0;
         return helperTimerRunning_;
+    }
+
+    void StopHelperTimer() {
+        KillTimer(window_, helperTimer);
+        helperTimerRunning_ = false;
     }
 
     Helper* StartFocusHelper(wchar_t* args) {
@@ -455,35 +487,34 @@ private:
         const auto foreground = GetForegroundWindow();
         const auto target = lastApplicationWindow_;
         if (!target || !IsTraySurface(foreground) || !IsWindowVisible(target) || IsIconic(target)) return;
-        auto dwm = LoadLibraryExW(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!dwm) return;
-        auto attribute = reinterpret_cast<decltype(&DwmGetWindowAttribute)>(GetProcAddress(dwm, "DwmGetWindowAttribute"));
+        const SystemLibrary dwm(L"dwmapi.dll");
+        const auto attribute = dwm.Find<decltype(&DwmGetWindowAttribute)>("DwmGetWindowAttribute");
         DWORD cloaked = 0;
         const bool visible = attribute && SUCCEEDED(attribute(target, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && !cloaked;
-        FreeLibrary(dwm);
         if (visible && GetForegroundWindow() == foreground) SetForegroundWindow(target);
     }
 
     void StartKeyboard() {
+        if (InputPaused()) return;
         wchar_t args[] = L"TouchKeyboardProbe --keyboard-helper";
         StartFocusHelper(args);
     }
 
     void StopXamlWatch() {
-        if (watch_.process) {
-            TerminateProcess(watch_.process, 0);
-            CloseHandle(watch_.process);
-        }
+        StopHelper(watch_.process);
         const auto generation = watch_.generation;
         watch_ = {};
         watch_.generation = generation;
     }
 
     void RefreshXamlWatch() {
-        if (watch_.thread) PostThreadMessageW(watch_.thread, readFocusMessage, 1, 0);
+        if (!watch_.thread || watch_.deadline || !EnsureHelperTimer()) return;
+        PostThreadMessageW(watch_.thread, readFocusMessage, 1, 0);
+        watch_.deadline = GetTickCount64() + helperTimeout;
     }
 
     void UpdateXamlWatch(HWND foreground, bool refresh = false) {
+        if (InputPaused()) return;
         if (watch_.process && watch_.window == foreground && slate_
             && WaitForSingleObject(watch_.process, 0) == WAIT_TIMEOUT) {
             if (refresh) RefreshXamlWatch();
@@ -498,7 +529,27 @@ private:
             return;
         watch_.process = StartHelper(args, job_, false, &watch_.thread);
         watch_.window = foreground;
-        watch_.started = GetTickCount64();
+        watch_.deadline = watch_.process ? GetTickCount64() + helperTimeout : 0;
+    }
+
+    void ReadTouch(HRAWINPUT input) {
+        if (InputPaused()) return;
+        const auto time = EventTick(static_cast<DWORD>(GetMessageTime()));
+        if (time < inputSince_) return;
+        UpdatePosture();
+        if (!slate_ || !focusHook_) return;
+        struct InputContext { App& app; ULONGLONG time; };
+        InputContext state{*this, time};
+        input_.Read(input, &state, [](void* context, const Tap& tap) {
+            const auto& [app, time] = *static_cast<InputContext*>(context);
+            if (tap.started) app.BeginTap(tap.device, *tap.started, time);
+            if (!tap.completed || tap.device != app.contact_.device) return;
+            FocusTrace("up valid=%d changed=%d focus=%p expected=%p", bool(tap.point),
+                FocusChangedSince(app.contact_.window, app.contact_.downTime),
+                FocusWindow(app.contact_.window), app.contact_.focus);
+            app.contact_.device = nullptr;
+            if (tap.point && app.ValidateTap()) app.CompleteTap(*tap.point);
+        });
     }
 
     void BeginTap(HANDLE device, POINT point, ULONGLONG time) {
@@ -516,6 +567,7 @@ private:
             DWORD pid = 0;
             if (GetWindowThreadProcessId(hit, &pid) && IsTextInputHost(pid)) return;
         }
+        UINT_PTR identity = 0;
         if (UsesXamlFocus(foreground)) {
             UpdateXamlWatch(foreground);
             if (!watch_.identity || watch_.changed >= time) {
@@ -523,20 +575,16 @@ private:
                 FocusTrace("XAML touch-down has no stable snapshot");
                 return;
             }
-            contactIdentity_ = watch_.identity;
+            identity = watch_.identity;
         }
-        contactDevice_ = device;
-        contactWindow_ = foreground;
-        contactFocus_ = focus;
-        contactDownTime_ = time;
-        contactPoint_ = point;
+        contact_ = {device, foreground, focus, point, time, identity};
     }
 
     bool ValidateTap() const {
-        return contactFocus_ && !GetSystemMetrics(SM_CONVERTIBLESLATEMODE)
-            && FocusWindow(contactWindow_) == contactFocus_
-            && (contactIdentity_ ? watch_.window == contactWindow_ && watch_.identity == contactIdentity_
-                && watch_.changed < contactDownTime_ : !FocusChangedSince(contactWindow_, contactDownTime_));
+        return !InputPaused() && contact_.focus && !GetSystemMetrics(SM_CONVERTIBLESLATEMODE)
+            && FocusWindow(contact_.window) == contact_.focus
+            && (contact_.identity ? watch_.window == contact_.window && watch_.identity == contact_.identity
+                && watch_.changed < contact_.downTime : !FocusChangedSince(contact_.window, contact_.downTime));
     }
 
     void CompleteTap(POINT point) {
@@ -545,35 +593,71 @@ private:
             L"TouchKeyboardProbe --tap-helper %llu %llu %llu %llu %ld %ld %ld %ld %llu",
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(window_)),
             static_cast<unsigned long long>(tapTicket_),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(contactWindow_)),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(contactFocus_)),
-            contactPoint_.x, contactPoint_.y, point.x, point.y, static_cast<unsigned long long>(contactIdentity_));
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(contact_.window)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(contact_.focus)),
+            contact_.point.x, contact_.point.y, point.x, point.y, static_cast<unsigned long long>(contact_.identity));
         if (size > 0) {
             if (auto helper = StartFocusHelper(args)) helper->ticket = tapTicket_;
         }
     }
 
-    void CancelTap() {
+    void ClearTap() {
         ++tapTicket_;
+        contact_ = {};
+    }
+
+    void CancelTap() {
+        ClearTap();
         for (auto& helper : focusHelpers_) {
             if (helper.process && helper.ticket && TerminateProcess(helper.process, 0))
                 helper.ticket = 0;
         }
-        contactDevice_ = nullptr;
-        contactFocus_ = nullptr;
-        contactIdentity_ = 0;
+    }
+
+    void ResetTouch() {
+        input_ = TouchInput{};
+        CancelTap();
+    }
+
+    void StopWorkers() {
+        ClearTap();
+        StopXamlWatch();
+        for (auto& helper : focusHelpers_) {
+            StopHelper(helper.process);
+            helper = {};
+        }
+        StopHelper(menuProcess_);
+        StopHelperTimer();
+    }
+
+    void ResetSessionInput() {
+        StopWorkers();
+        input_ = TouchInput{};
+        focusEvent = {};
+        lastApplicationWindow_ = nullptr;
+        if (InputPaused()) {
+            KillTimer(window_, recoveryTimer);
+            return;
+        }
+        inputSince_ = GetTickCount64();
+        inputRegistered_ = false;
+        RepairRegistrations();
+        slate_ = !GetSystemMetrics(SM_CONVERTIBLESLATEMODE);
+        const auto foreground = GetForegroundWindow();
+        RememberApplication(foreground);
+        UpdateXamlWatch(foreground);
     }
 
     void UpdatePosture() {
         const bool slate = !GetSystemMetrics(SM_CONVERTIBLESLATEMODE);
         if (slate == slate_) return;
         slate_ = slate;
-        input_ = TouchInput{};
-        CancelTap();
+        ResetTouch();
         UpdateXamlWatch(GetForegroundWindow());
     }
 
     void Menu(bool fromTray = false, WPARAM coordinates = 0) {
+        if (InputPaused()) return;
         if (menuProcess_ && WaitForSingleObject(menuProcess_, 0) == WAIT_OBJECT_0) CheckHelpers();
         if (!window_ || menuProcess_) return;
         POINT anchor{};
@@ -608,13 +692,19 @@ private:
     void CheckHelpers() {
         const auto now = GetTickCount64();
         if (watch_.process && (WaitForSingleObject(watch_.process, 0) == WAIT_OBJECT_0
-            || (!watch_.revision && now - watch_.started >= 4000))) StopXamlWatch();
+            || (watch_.deadline && now >= watch_.deadline))) {
+            const auto foreground = GetForegroundWindow();
+            // Retry a stalled refresh once. A watcher that cannot start waits for the next input.
+            const bool restart = watch_.deadline && watch_.revision && watch_.window == foreground;
+            StopXamlWatch();
+            if (restart) UpdateXamlWatch(foreground);
+        }
         for (auto& helper : focusHelpers_) {
             if (!helper.process) continue;
             if (WaitForSingleObject(helper.process, 0) == WAIT_OBJECT_0) {
                 CloseHandle(helper.process);
                 helper = {};
-            } else if (now - helper.started >= 4000) {
+            } else if (now - helper.started >= helperTimeout) {
                 TerminateProcess(helper.process, 0);
             }
         }
@@ -641,10 +731,9 @@ private:
             if (!window_) return;
         }
         if (!menuProcess_) {
-            if (watch_.process && !watch_.revision) return;
+            if (watch_.deadline) return;
             for (const auto& helper : focusHelpers_) if (helper.process) return;
-            KillTimer(window_, helperTimer);
-            helperTimerRunning_ = false;
+            StopHelperTimer();
         }
     }
 
@@ -663,12 +752,17 @@ private:
     HWINEVENTHOOK focusHook_{};
     HWINEVENTHOOK foregroundHook_{};
     bool slate_{};
-    HANDLE contactDevice_{};
-    HWND contactWindow_{}, contactFocus_{};
-    POINT contactPoint_{};
+    bool sleeping_{}, sessionLocked_{};
+    bool inputRegistered_{}, sessionRegistered_{};
+    ULONGLONG inputSince_{};
     UINT_PTR tapTicket_{};
-    UINT_PTR contactIdentity_{};
-    ULONGLONG contactDownTime_{};
+    struct {
+        HANDLE device{};
+        HWND window{}, focus{};
+        POINT point{};
+        ULONGLONG downTime{};
+        UINT_PTR identity{};
+    } contact_;
     TouchInput input_;
     std::array<Helper, 8> focusHelpers_{};
     struct {
@@ -676,7 +770,7 @@ private:
         HWND window{};
         DWORD generation{}, revision{}, thread{};
         UINT_PTR identity{};
-        ULONGLONG started{}, changed{};
+        ULONGLONG deadline{}, changed{};
     } watch_;
 };
 

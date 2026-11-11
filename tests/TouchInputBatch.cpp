@@ -1,8 +1,6 @@
 #include <array>
 #include <cstring>
-#define private public
 #include "../native/TouchInput.h"
-#undef private
 
 namespace {
 const HANDLE deviceHandle = reinterpret_cast<HANDLE>(1);
@@ -22,7 +20,28 @@ UINT TestRawInput(HRAWINPUT, UINT, LPVOID data, PUINT size, UINT) {
     return *size;
 }
 
-UINT TestDeviceInfo(HANDLE, UINT, LPVOID, PUINT) { return UINT(-1); }
+bool descriptorAvailable = false;
+UINT TestDeviceInfo(HANDLE, UINT kind, LPVOID data, PUINT size) {
+    if (kind != RIDI_PREPARSEDDATA || !descriptorAvailable) return UINT(-1);
+    *size = 1;
+    return data ? 1 : 0;
+}
+
+NTSTATUS TestCaps(PHIDP_PREPARSED_DATA, PHIDP_CAPS caps) {
+    caps->UsagePage = 0x0d;
+    caps->Usage = 0x04;
+    caps->NumberInputValueCaps = 1;
+    return HIDP_STATUS_SUCCESS;
+}
+
+NTSTATUS TestAxisCaps(HIDP_REPORT_TYPE, USAGE, USHORT, USAGE, PHIDP_VALUE_CAPS caps,
+    PUSHORT count, PHIDP_PREPARSED_DATA) {
+    *count = 1;
+    caps->ReportID = 1;
+    caps->BitSize = 16;
+    caps->LogicalMax = 100;
+    return HIDP_STATUS_SUCCESS;
+}
 
 NTSTATUS TestUsageValue(HIDP_REPORT_TYPE, USAGE, USHORT, USAGE usage, PULONG value,
     PHIDP_PREPARSED_DATA, PCHAR report, ULONG) {
@@ -60,6 +79,8 @@ void RecordTap(void* context, const Tap& tap) {
 
 #define GetRawInputData TestRawInput
 #define GetRawInputDeviceInfoW TestDeviceInfo
+#define HidP_GetCaps TestCaps
+#define HidP_GetSpecificValueCaps TestAxisCaps
 #define HidP_GetUsageValue TestUsageValue
 #define HidP_GetUsages TestUsages
 #define GetPointerDeviceRects TestPointerRects
@@ -70,15 +91,15 @@ void RecordTap(void* context, const Tap& tap) {
 
 int main() {
     TouchInput input;
-    auto& device = input.devices_.try_emplace(deviceHandle, deviceHandle).first->second;
-    TouchInput::Device::Axes axes{};
-    axes.x.ReportID = axes.y.ReportID = 1;
-    axes.x.LogicalMax = axes.y.LogicalMax = 100;
-    device.axes.push_back(axes);
+
     RecordedTaps record;
 
     reportCount = 1;
     reports[0] = {1, 1, 20};
+    // Device metadata may be temporarily unavailable on the first report after wake.
+    input.Read(nullptr, &record, RecordTap);
+    if (record.count) return 4;
+    descriptorAvailable = true;
     input.Read(nullptr, &record, RecordTap);
     if (record.count != 1 || record.events[0] != 20) return 1;
 

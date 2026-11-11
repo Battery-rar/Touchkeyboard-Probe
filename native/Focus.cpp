@@ -182,11 +182,9 @@ public:
         int source = 0;
         if (element) element->get_CachedProcessId(&source);
         // The keyboard can report UIA focus without taking the app's Win32 foreground.
-        if (source > 0 && DWORD(source) != foregroundPid_ && IsTextInputHost(DWORD(source))) {
-            FocusTrace("XAML ignored input host focus pid=%d", source);
-            return;
-        }
-        const auto identity = RuntimeIdentity(element.get(), automation_);
+        const bool inputHost = source > 0 && DWORD(source) != foregroundPid_ && IsTextInputHost(DWORD(source));
+        if (inputHost && !republish) return;
+        const auto identity = inputHost ? identity_ : RuntimeIdentity(element.get(), automation_);
         if (!republish && revision_ && identity == identity_) return;
         const auto revision = revision_ + 1;
         if (PostMessageW(owner_, focusSnapshotMessage, (UINT_PTR(generation_) << 32) | revision, LPARAM(identity))) {
@@ -295,47 +293,47 @@ Com<IUIAutomationElement> EditableAncestor(IUIAutomationTreeWalker* walker, Com<
     return {};
 }
 
-Com<IUIAutomationElement> FocusedField(IUIAutomation* ui, IUIAutomationTreeWalker* walker,
-    POINT point, HWND foreground, const ComRuntime& runtime, const POINT* down = nullptr,
-    UINT_PTR previousFocus = 0, bool* snapshotMismatch = nullptr) {
+bool FieldContainsTap(IUIAutomationElement* field, POINT down, POINT up) {
+    RECT bounds{};
+    const auto hr = field->get_CachedBoundingRectangle(&bounds);
+    FocusTrace("uia bounds hr=%lx point=%ld,%ld bounds=%ld,%ld,%ld,%ld",
+        hr, up.x, up.y, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    return SUCCEEDED(hr) && PtInRect(&bounds, down) && PtInRect(&bounds, up);
+}
+
+bool TapHitsFocusedField(IUIAutomation* ui, IUIAutomationTreeWalker* walker, HWND foreground,
+    POINT down, POINT up, const ComRuntime& runtime, UINT_PTR previousFocus, bool& snapshotMismatch) {
     auto cache = FieldCache(ui);
-    if (!cache) return {};
+    if (!cache) return false;
     IUIAutomationElement* focused = nullptr;
     ui->GetFocusedElementBuildCache(cache.get(), &focused);
     Com<IUIAutomationElement> focus(focused);
     if (previousFocus) {
         const auto current = RuntimeIdentity(focus.get(), GetModuleHandleW(L"oleaut32.dll"));
         if (current != previousFocus) {
-            if (snapshotMismatch) *snapshotMismatch = true;
+            snapshotMismatch = true;
             FocusTrace("XAML focus differs from touch-down snapshot expected=%llu current=%llu", previousFocus, current);
-            return {};
+            return false;
         }
     }
     auto field = EditableAncestor(walker, std::move(focus), cache.get(), runtime);
     IUIAutomationElement* hitElement = nullptr;
     if (!field) {
-        if (GetAncestor(WindowFromPoint(point), GA_ROOT) != foreground) return {};
-        ui->ElementFromPointBuildCache(point, cache.get(), &hitElement);
+        if (GetAncestor(WindowFromPoint(up), GA_ROOT) != foreground) return false;
+        ui->ElementFromPointBuildCache(up, cache.get(), &hitElement);
         auto hit = EditableAncestor(walker, Com<IUIAutomationElement>(hitElement), cache.get(), runtime);
         BOOL hasFocus = FALSE;
         if (!hit || FAILED(hit->get_CachedHasKeyboardFocus(&hasFocus)) || !hasFocus) {
             FocusTrace("uia focus lookup and focused hit unavailable");
-            return {};
+            return false;
         }
-        RECT hitBounds{};
-        if (SUCCEEDED(hit->get_CachedBoundingRectangle(&hitBounds)) && PtInRect(&hitBounds, point)
-            && (!down || PtInRect(&hitBounds, *down))) return hit;
-        return {};
+        return FieldContainsTap(hit.get(), down, up);
     }
-    RECT bounds{};
-    const auto bounded = field->get_CachedBoundingRectangle(&bounds);
-    FocusTrace("uia editable=%d bound=%lx point=%ld,%ld bounds=%ld,%ld,%ld,%ld", bool(field), bounded,
-        point.x, point.y, bounds.left, bounds.top, bounds.right, bounds.bottom);
-    if (FAILED(bounded) || !PtInRect(&bounds, point) || (down && !PtInRect(&bounds, *down))) return {};
+    if (!FieldContainsTap(field.get(), down, up)) return false;
 
-    ui->ElementFromPointBuildCache(point, cache.get(), &hitElement);
+    ui->ElementFromPointBuildCache(up, cache.get(), &hitElement);
     Com<IUIAutomationElement> hit(hitElement);
-    if (!hit) return {};
+    if (!hit) return false;
     CONTROLTYPEID hitType = 0;
     int hitProcess = 0, fieldProcess = -1;
     hit->get_CachedControlType(&hitType);
@@ -344,19 +342,17 @@ Com<IUIAutomationElement> FocusedField(IUIAutomation* ui, IUIAutomationTreeWalke
     FocusTrace("uia hit type=%d pid=%d field pid=%d", hitType, hitProcess, fieldProcess);
     // Task View can hit-test the desktop card while its inline name editor has focus.
     if (hitType == UIA_ListItemControlTypeId && hitProcess == fieldProcess
-        && GetAncestor(WindowFromPoint(point), GA_ROOT) == foreground
-        && Same(ui, hit.get(), Parent(walker, field.get(), cache.get()).get())) return field;
+        && GetAncestor(WindowFromPoint(up), GA_ROOT) == foreground
+        && Same(ui, hit.get(), Parent(walker, field.get(), cache.get()).get())) return true;
     for (int depth = 0; hit && depth < 10; ++depth) {
-        if (Same(ui, hit.get(), field.get())) return field;
-        if (IsEditable(hit.get(), runtime)) return {};
+        if (Same(ui, hit.get(), field.get())) return true;
+        if (IsEditable(hit.get(), runtime)) return false;
         hit = Parent(walker, hit.get(), cache.get());
     }
     // Some browser providers return a host instead of their focused edit on hit testing.
-    if ((hitType == UIA_PaneControlTypeId || hitType == UIA_WindowControlTypeId
+    return (hitType == UIA_PaneControlTypeId || hitType == UIA_WindowControlTypeId
         || hitType == UIA_ToolBarControlTypeId || hitType == UIA_GroupControlTypeId || hitType == UIA_CustomControlTypeId)
-        && hitProcess == fieldProcess && GetAncestor(WindowFromPoint(point), GA_ROOT) == foreground)
-        return field;
-    return {};
+        && hitProcess == fieldProcess && GetAncestor(WindowFromPoint(up), GA_ROOT) == foreground;
 }
 }
 
@@ -381,10 +377,10 @@ int CheckTap(HWND owner, UINT_PTR ticket, HWND foreground, HWND focus, POINT dow
     Com<IUIAutomationTreeWalker> walker(rawWalker);
     if (!walker) return 0;
     bool snapshotMismatch = false;
-    auto field = FocusedField(ui.get(), walker.get(), up, foreground, runtime, &down, previousFocus, &snapshotMismatch);
+    const bool hit = TapHitsFocusedField(ui.get(), walker.get(), foreground, down, up, runtime, previousFocus, snapshotMismatch);
     if (snapshotMismatch) PostMessageW(owner, focusSnapshotMismatchMessage, ticket, 0);
-    FocusTrace("tap field=%d focus=%p", bool(field), FocusWindow(foreground));
-    if (!field || FocusWindow(foreground) != focus) return 0;
+    FocusTrace("tap field=%d focus=%p", hit, FocusWindow(foreground));
+    if (!hit || FocusWindow(foreground) != focus) return 0;
     // Brief contention must not discard the current tap; its ticket is rechecked after acquiring the lock.
     OpenSystemKeyboard(runtime, [&] {
         // Leave the request cancelable while the system prepares the keyboard.

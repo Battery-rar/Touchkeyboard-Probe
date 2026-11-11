@@ -37,6 +37,7 @@ private:
         Tap Observe(PCHAR report, DWORD length);
 
         HANDLE handle;
+        bool retry{};
         std::vector<std::byte> descriptor;
         struct Axes { HIDP_VALUE_CAPS x, y; };
         std::vector<Axes> axes;
