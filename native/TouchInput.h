@@ -29,7 +29,7 @@ class TouchInput {
 public:
     static bool Register(HWND window);
     void DeviceChanged(HANDLE device);
-    Tap Read(HRAWINPUT input);
+    void Read(HRAWINPUT input, void* context, void (*onTap)(void*, const Tap&));
 
 private:
     struct Device {
@@ -37,6 +37,7 @@ private:
         Tap Observe(PCHAR report, DWORD length);
 
         HANDLE handle;
+        bool retry{};
         std::vector<std::byte> descriptor;
         struct Axes { HIDP_VALUE_CAPS x, y; };
         std::vector<Axes> axes;
