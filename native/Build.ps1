@@ -14,9 +14,10 @@ $root = Split-Path $source
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $root 'obj/zig-cache'
 $Architecture = $Architecture.ToLowerInvariant()
 $target = if ($Architecture -eq 'x64') { 'x86_64-windows-gnu' } else { 'aarch64-windows-gnu' }
-$scratch = Join-Path $root "obj/native-$Architecture"
+$suffix = '-Win10'
+$scratch = Join-Path $root "obj/native-$Architecture$suffix"
 $env:ZIG_LOCAL_CACHE_DIR = Join-Path $scratch 'cache'
-$output = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $root "bin/native-$Architecture" }
+$output = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $root "bin/native-$Architecture$suffix" }
 New-Item -ItemType Directory -Force $scratch, $output | Out-Null
 $resource = Join-Path $scratch 'Keyboard.res'
 $traceFlags = @(if ($Trace) { '-DFOCUS_TRACE' })
@@ -45,14 +46,14 @@ $responseLines = @(
 [IO.File]::WriteAllLines($response, [string[]]$responseLines, [Text.UTF8Encoding]::new($false))
 & $CppWinRT "@$response"
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-& $Zig rc "/I$source" "/fo$resource" (Join-Path $source 'Keyboard.rc')
+& $Zig rc "/DTOUCHKEYBOARD_WIN10_STYLE" "/I$source" "/fo$resource" (Join-Path $source 'Keyboard.rc')
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & $Zig c++ -target $target -std=c++20 -Os -s -DUNICODE -D_UNICODE -DNOMINMAX `
-    @traceFlags `
+    @traceFlags -DTOUCHKEYBOARD_WIN10_STYLE `
     -DNTDDI_VERSION=0x0A000007 -Wno-nonportable-include-path -isystem $projection `
     -idirafter (Join-Path $sdkInclude 'um') `
     -municode '-Wl,/subsystem:windows' (Join-Path $source 'Tray.cpp') (Join-Path $source 'TouchInput.cpp') `
     (Join-Path $source 'Focus.cpp') (Join-Path $source 'SystemMenu.cpp') `
     $resource -luser32 -ladvapi32 -lhid $winrt `
-    -o (Join-Path $output "TouchKeyboardProbe.exe")
+    -o (Join-Path $output "TouchKeyboardProbe$suffix.exe")
 exit $LASTEXITCODE

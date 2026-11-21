@@ -48,6 +48,13 @@ using namespace Hosting;
 
 constexpr UINT_PTR startupTimer = 1;
 constexpr int closeRequested = 1;
+#ifdef TOUCHKEYBOARD_WIN10_STYLE
+constexpr double menuCornerRadius = 0;
+constexpr wchar_t menuIconFont[] = L"Segoe MDL2 Assets";
+#else
+constexpr double menuCornerRadius = 8;
+constexpr wchar_t menuIconFont[] = L"Segoe Fluent Icons";
+#endif
 struct Item { UINT id; const wchar_t* label; const wchar_t* glyph; };
 
 void AddRuntime() {
@@ -116,7 +123,8 @@ void OpenFlyout(HWND host, HWND owner, bool above, const Item (&items)[6], bool&
     flyout.Placement(above ? FlyoutPlacementMode::TopEdgeAlignedRight : FlyoutPlacementMode::BottomEdgeAlignedRight);
     try {
         Style style({hstring(name_of<MenuFlyoutPresenter>()), Windows::UI::Xaml::Interop::TypeKind::Metadata});
-        style.Setters().Append(Setter(Control::CornerRadiusProperty(), box_value(CornerRadius{8, 8, 8, 8})));
+        style.Setters().Append(Setter(Control::CornerRadiusProperty(), box_value(
+            CornerRadius{menuCornerRadius, menuCornerRadius, menuCornerRadius, menuCornerRadius})));
         HIGHCONTRASTW contrast{sizeof(contrast)};
         if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0)
             && !(contrast.dwFlags & HCF_HIGHCONTRASTON)) {
@@ -132,8 +140,11 @@ void OpenFlyout(HWND host, HWND owner, bool above, const Item (&items)[6], bool&
         }
         MenuFlyoutItem row;
         row.Text(item.label);
+#ifdef TOUCHKEYBOARD_WIN10_STYLE
+        row.CornerRadius({});
+#endif
         FontIcon icon;
-        icon.FontFamily(Media::FontFamily(L"Segoe Fluent Icons"));
+        icon.FontFamily(Media::FontFamily(menuIconFont));
         icon.Glyph(item.glyph);
         row.Icon(icon);
         row.Click([&, id = item.id](auto&&, auto&&) { selected = static_cast<int>(id); });

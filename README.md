@@ -1,6 +1,6 @@
 # 触摸键盘常驻工具
 
-在 Windows 11 上运行与设备架构对应的 `TouchKeyboardProbe.exe`，默认构建目录为 `bin\native-arm64` 或 `bin\native-x64`。这个文件可以单独复制到其他目录。更新前，从托盘退出旧版工具。手势工具 `GestureSign` 可以继续运行。
+在 Windows 11 上运行与设备架构对应的 `TouchKeyboardProbe-Win10.exe`。此分支采用 Windows 10 风格的键盘图标与直角亚克力菜单。这个文件可以单独复制到其他目录。更新前，从托盘退出旧版工具。手势工具 `GestureSign` 可以继续运行。
 
 在「设置 → 时间和语言 → 输入 → 触摸键盘」把自动显示设为「从不」。拔下可拆卸键盘后，点未聚焦的输入框由应用切换焦点。点当前已有焦点的输入框，抬手即请求打开键盘。即使焦点来自鼠标或键盘，也适用同一规则。
 
@@ -12,8 +12,8 @@
 在 `PowerShell` 中也可以用参数直接恢复图标或退出。
 
 ```powershell
-.\TouchKeyboardProbe.exe --show-tray
-.\TouchKeyboardProbe.exe --exit
+.\TouchKeyboardProbe-Win10.exe --show-tray
+.\TouchKeyboardProbe-Win10.exe --exit
 ```
 
 工具根据 Windows 报告的二合一设备姿态判断可拆卸键盘是否可用。外接有线或蓝牙键盘可能不会改变该状态。输入框需要通过 Windows 辅助功能接口提供焦点和可编辑状态。
@@ -26,5 +26,7 @@
 .\native\Build.ps1 -Zig C:\path\to\zig.exe -Architecture x64
 .\native\Build.ps1 -Zig C:\path\to\zig.exe -Architecture arm64
 ```
+
+构建默认在 `bin\native-x64-Win10` 或 `bin\native-arm64-Win10` 生成 `TouchKeyboardProbe-Win10.exe`。
 
 根目录的 `C#` 源码保留了前一版及其诊断参数。
