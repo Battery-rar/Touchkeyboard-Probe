@@ -58,11 +58,16 @@ void AddRuntime() {
     auto add = reinterpret_cast<Add>(GetProcAddress(kernel, "AddPackageDependency"));
     check_bool(pin && add);
     PWSTR dependency = nullptr;
-    constexpr DWORD arm64Architecture = 0x10;
+    // PackageDependencyProcessorArchitectures values for the compiled target.
+#if defined(_M_ARM64) || defined(__aarch64__)
+    constexpr DWORD packageArchitecture = 0x10;
+#else
+    constexpr DWORD packageArchitecture = 0x04;
+#endif
     constexpr int processLifetime = 0;
     // The dependency lives only as long as this menu process.
     check_hresult(pin(nullptr, L"Microsoft.WindowsAppRuntime.2_8wekyb3d8bbwe",
-        {}, arm64Architecture, processLifetime, nullptr, 0, &dependency));
+        {}, packageArchitecture, processLifetime, nullptr, 0, &dependency));
     void* context = nullptr;
     const auto result = add(dependency, 0, 0, &context, nullptr);
     HeapFree(GetProcessHeap(), 0, dependency);

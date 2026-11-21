@@ -303,7 +303,8 @@ private:
             }
             return 0;
         case recoverMessage:
-            Menu();
+            if (hidden_) SetHidden(false);
+            else Menu();
             return 0;
         case commandMessage:
             CommandReceived(static_cast<UINT>(wp));
